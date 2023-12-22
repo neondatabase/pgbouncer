@@ -411,3 +411,82 @@ def test_auth_dbname_works_fine(
         # The client connects to postgres DB that matches with autodb
         # pgbouncer must use postgres_authdb1, which is defined in [pgbouncer] section
         bouncer.test(user="stats", password="stats", dbname="postgres")
+
+
+async def test_change_server_password_reconnect(bouncer, pg):
+    bouncer.default_db = "p4"
+    bouncer.admin(f"set default_pool_size=1")
+    bouncer.admin(f"set pool_mode=transaction")
+    try:
+        # good password, opens connection
+        bouncer.test()
+        pg.sql("ALTER USER puser1 PASSWORD 'bar'")
+        # works fine because server connection is still open
+        bouncer.test()
+        with bouncer.transaction() as cur1:
+            # Claim the connection
+            cur1.execute("select 1")
+            # Because of our fast client closure on server auth failures (see
+            # kill_pool_logins), we should only have one connection failing at
+            # the postgres side. But we should still have 3 failing at the
+            # pgbouncer side.
+            with pg.log_contains(r"password authentication failed", times=1):
+                result1 = bouncer.atest()
+                result2 = bouncer.atest()
+                result3 = bouncer.atest()
+
+                # Mark the old connection as dirty
+                bouncer.admin("reconnect")
+                # Trigger new connection creation
+                bouncer.admin(f"set default_pool_size=2")
+                with pytest.raises(
+                    psycopg.OperationalError, match="password authentication failed"
+                ):
+                    await result1
+                with pytest.raises(
+                    psycopg.OperationalError, match="password authentication failed"
+                ):
+                    await result2
+                with pytest.raises(
+                    psycopg.OperationalError, match="password authentication failed"
+                ):
+                    await result3
+    finally:
+        pg.sql("ALTER USER puser1 PASSWORD 'foo'")
+
+
+async def test_change_server_password_server_lifetime(bouncer, pg):
+    bouncer.default_db = "p4"
+    bouncer.admin(f"set default_pool_size=1")
+    bouncer.admin(f"set pool_mode=transaction")
+    bouncer.admin(f"set server_lifetime=1")
+    try:
+        # good password, opens connection
+        bouncer.test()
+        pg.sql("ALTER USER puser1 PASSWORD 'bar'")
+        # wait until server disconnect
+        time.sleep(2)
+
+        # Because of our fast client closure on server auth failures (see
+        # kill_pool_logins), we should only have one connection failing at
+        # the postgres side. But we should still have 3 failing at the
+        # pgbouncer side.
+        with pg.log_contains(r"password authentication failed", times=1):
+            result1 = bouncer.atest()
+            result2 = bouncer.atest()
+            result3 = bouncer.atest()
+
+            with pytest.raises(
+                psycopg.OperationalError, match="password authentication failed"
+            ):
+                await result1
+            with pytest.raises(
+                psycopg.OperationalError, match="password authentication failed"
+            ):
+                await result2
+            with pytest.raises(
+                psycopg.OperationalError, match="password authentication failed"
+            ):
+                await result3
+    finally:
+        pg.sql("ALTER USER puser1 PASSWORD 'foo'")
